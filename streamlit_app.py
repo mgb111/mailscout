@@ -1,5 +1,9 @@
 import ast
+import pandas as pd
 from typing import List, Dict, Union
+import re
+import socket
+import dns.resolver
 
 import streamlit as st
 
@@ -88,6 +92,189 @@ def create_scout(options: Dict[str, Union[bool, int]]) -> Scout:
     )
 
 
+def extract_domain_from_url(url: str) -> str:
+    """Extract domain from various URL formats and company names."""
+    if not url or pd.isna(url):
+        return ""
+    
+    url = str(url).strip()
+    
+    # Handle LinkedIn company URLs
+    if 'linkedin.com/company' in url:
+        return 'linkedin.com'
+    
+    # Extract domain from regular URLs
+    domain_pattern = r'https?://(?:www\.)?([^/\s]+)'
+    match = re.search(domain_pattern, url)
+    if match:
+        return match.group(1)
+    
+    # If it's already a domain (no http/https)
+    if '.' in url and not url.startswith('http'):
+        return url
+    
+    # Handle company names that might be domains
+    # Clean up company names and check if they could be domains
+    cleaned = re.sub(r'[^\w\s.-]', '', url)  # Remove special chars except dots and hyphens
+    cleaned = re.sub(r'\s+', '', cleaned)     # Remove spaces
+    
+    # If it looks like a domain (has dots and reasonable length)
+    if '.' in cleaned and len(cleaned) > 5 and not cleaned.startswith('.'):
+        return cleaned.lower()
+    
+    return ""
+
+def find_best_company_domain(company_name: str) -> str:
+    """Find the most likely domain for a company by checking multiple variations."""
+    if not company_name or pd.isna(company_name):
+        return ""
+    
+    company = str(company_name).strip()
+    
+    # Clean company name
+    cleaned = re.sub(r'[^\w\s]', ' ', company)  # Keep only alphanumeric and spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()  # Normalize spaces
+    
+    if not cleaned:
+        return ""
+    
+    # Split into words
+    words = cleaned.split()
+    
+    # Priority order for domain extensions (most common first)
+    extensions = ['.com', '.org', '.net', '.co', '.io', '.tech', '.app']
+    
+    # Generate domain candidates in priority order
+    candidates = []
+    
+    if len(words) == 1:
+        # Single word company
+        word = words[0].lower()
+        if len(word) > 2:
+            for ext in extensions:
+                candidates.append(f"{word}{ext}")
+    
+    elif len(words) == 2:
+        # Two word company
+        word1, word2 = words[0].lower(), words[1].lower()
+        if len(word1) > 2 and len(word2) > 2:
+            # Combined words
+            for ext in extensions:
+                candidates.append(f"{word1}{word2}{ext}")
+            # Dotted format
+            for ext in extensions:
+                candidates.append(f"{word1}.{word2}{ext}")
+    
+    elif len(words) > 2:
+        # Multi-word company - try first two words
+        word1, word2 = words[0].lower(), words[1].lower()
+        if len(word1) > 2 and len(word2) > 2:
+            for ext in extensions:
+                candidates.append(f"{word1}{word2}{ext}")
+        
+        # Try acronym
+        acronym = ''.join([word[0].upper() for word in words if len(word) > 1])
+        if len(acronym) > 2:
+            for ext in extensions:
+                candidates.append(f"{acronym.lower()}{ext}")
+    
+    # Return the first candidate (most common format)
+    return candidates[0] if candidates else ""
+
+def check_domain_mx(domain: str) -> bool:
+    """Check if a domain has valid MX records (mail servers)."""
+    try:
+        # Try to resolve MX records
+        dns.resolver.resolve(domain, 'MX')
+        return True
+    except Exception:
+        return False
+
+def check_domain_exists(domain: str) -> bool:
+    """Check if a domain exists by trying to resolve it."""
+    try:
+        socket.gethostbyname(domain)
+        return True
+    except Exception:
+        return False
+
+def validate_domain_before_processing(domain: str) -> Dict[str, bool]:
+    """Validate a domain before processing to avoid unnecessary SMTP attempts."""
+    results = {
+        "domain_exists": False,
+        "has_mx_records": False,
+        "is_valid": False
+    }
+    
+    if not domain or domain == "linkedin.com":
+        return results
+    
+    # Check if domain exists
+    results["domain_exists"] = check_domain_exists(domain)
+    
+    if results["domain_exists"]:
+        # Check if it has mail servers
+        results["has_mx_records"] = check_domain_mx(domain)
+        results["is_valid"] = results["has_mx_records"]
+    
+    return results
+
+def process_csv_data(df: pd.DataFrame, name_columns: List[str], company_url_column: str) -> List[Dict[str, Union[str, List[str]]]]:
+    """Process CSV data and extract domains and names for email finding."""
+    email_data = []
+    
+    for idx, row in df.iterrows():
+        # Extract names
+        names = []
+        for col in name_columns:
+            if col in df.columns and pd.notna(row[col]) and str(row[col]).strip():
+                name = str(row[col]).strip()
+                if name and name not in names:  # Avoid duplicates
+                    names.append(name)
+        
+        if not names:
+            continue
+            
+        # Extract domain from company column
+        company_value = row.get(company_url_column, "")
+        domain = extract_domain_from_url(company_value)
+        
+        # Debug info
+        print(f"Row {idx}: Company='{company_value}' -> Domain='{domain}'")
+        
+        # If no domain found, try to find the best company domain
+        if not domain and company_value and not pd.isna(company_value):
+            domain = find_best_company_domain(company_value)
+            if domain:
+                print(f"  Found best domain '{domain}' for company '{company_value}'")
+        
+        # If still no domain, try to extract from other columns that might contain URLs
+        if not domain:
+            for col in df.columns:
+                if 'href' in col.lower() or 'url' in col.lower() or 'link' in col.lower():
+                    potential_url = row.get(col, "")
+                    if potential_url and pd.notna(potential_url):
+                        domain = extract_domain_from_url(potential_url)
+                        if domain:
+                            print(f"  Found domain '{domain}' in column '{col}'")
+                            break
+        
+        if not domain:
+            continue
+            
+        # Validate domain before adding to processing list
+        domain_validation = validate_domain_before_processing(domain)
+        
+        email_data.append({
+            "domain": domain,
+            "names": names,
+            "original_row": row.to_dict(),
+            "domain_validation": domain_validation
+        })
+    
+    return email_data
+
+
 def main() -> None:
     st.set_page_config(page_title="MailScout", page_icon="📧", layout="centered")
     st.title("📧 MailScout")
@@ -97,7 +284,7 @@ def main() -> None:
 
     options = render_sidebar()
 
-    tab_find, tab_bulk, tab_utils = st.tabs(["Find emails", "Bulk", "Utilities"])
+    tab_find, tab_bulk, tab_csv, tab_utils = st.tabs(["Find emails", "Bulk", "CSV Upload", "Utilities"])
 
     with tab_find:
         st.subheader("Find Emails for a Domain")
@@ -187,6 +374,224 @@ def main() -> None:
                     st.json(results)
                 else:
                     st.warning("No results produced.")
+
+    with tab_csv:
+        st.subheader("CSV File Processing")
+        st.caption("Upload a CSV file with names and company information to automatically find emails.")
+        
+        uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
+        
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                st.success(f"CSV loaded successfully! Shape: {df.shape}")
+                
+                # Show column selection
+                st.subheader("Configure Column Mapping")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Available columns:**")
+                    st.write(list(df.columns))
+                
+                with col2:
+                    st.write("**Sample data:**")
+                    st.dataframe(df.head(3))
+                
+                # Column selection
+                st.subheader("Select Columns")
+                name_columns = st.multiselect(
+                    "Select name columns (e.g., First Name, Last Name)",
+                    df.columns,
+                    help="Choose columns containing person names"
+                )
+                
+                company_url_column = st.selectbox(
+                    "Select company/URL column",
+                    [""] + list(df.columns),
+                    help="Choose column containing company URLs or domains"
+                )
+                
+                if name_columns and company_url_column:
+                    st.success("Column mapping configured!")
+                    
+                    # Process CSV data
+                    email_data = process_csv_data(df, name_columns, company_url_column)
+                    
+                    if email_data:
+                        st.info(f"Found {len(email_data)} valid entries to process")
+                        
+                        # Show preview with more details
+                        preview_data = []
+                        for item in email_data[:10]:
+                            preview_data.append({
+                                "Names": " + ".join(item["names"]),
+                                "Domain": item["domain"],
+                                "Company Value": str(item["original_row"].get(company_url_column, ""))[:50] + "...",
+                                "Sample Row": str(item["original_row"])[:100] + "..."
+                            })
+                        
+                        preview_df = pd.DataFrame(preview_data)
+                        st.write("**Preview of data to process:**")
+                        st.dataframe(preview_df)
+                        
+                        # Show all extracted data for processing
+                        st.write("**All extracted data for processing:**")
+                        all_data = []
+                        for item in email_data:
+                            validation = item.get("domain_validation", {})
+                            all_data.append({
+                                "Names": " + ".join(item["names"]),
+                                "Domain": item["domain"],
+                                "Company": str(item["original_row"].get(company_url_column, ""))[:50],
+                                "Domain Exists": "✅" if validation.get("domain_exists", False) else "❌",
+                                "Has Mail Servers": "✅" if validation.get("has_mx_records", False) else "❌",
+                                "Valid for Email": "✅" if validation.get("is_valid", False) else "❌"
+                            })
+                        st.dataframe(pd.DataFrame(all_data))
+                        
+                        # Filter to only valid domains
+                        valid_domains = [item for item in email_data if item.get("domain_validation", {}).get("is_valid", False)]
+                        invalid_domains = [item for item in email_data if not item.get("domain_validation", {}).get("is_valid", False)]
+                        
+                        if valid_domains:
+                            st.success(f"✅ {len(valid_domains)} domains are valid and ready for email finding!")
+                            st.info(f"❌ {len(invalid_domains)} domains are invalid and will be skipped.")
+                        else:
+                            st.warning("❌ No valid domains found. All generated domains appear to be invalid.")
+                            st.info("This could mean:")
+                            st.info("- The company names don't match their actual domains")
+                            st.info("- The companies use different domain naming conventions")
+                            st.info("- Some companies might not have websites")
+                        
+                        # Show potential domains for each company
+                        st.write("**Domain validation results:**")
+                        domain_analysis = []
+                        for item in email_data:
+                            company_name = str(item["original_row"].get(company_url_column, ""))
+                            validation = item.get("domain_validation", {})
+                            if company_name and not pd.isna(company_name):
+                                best_domain = find_best_company_domain(company_name)
+                                domain_analysis.append({
+                                    "Company": company_name[:50],
+                                    "Generated Domain": item["domain"],
+                                    "Best Domain Found": best_domain if best_domain else "None",
+                                    "Domain Exists": "✅" if validation.get("domain_exists", False) else "❌",
+                                    "Has Mail Servers": "✅" if validation.get("has_mx_records", False) else "❌",
+                                    "Valid for Email": "✅" if validation.get("is_valid", False) else "❌"
+                                })
+                        
+                        if domain_analysis:
+                            st.dataframe(pd.DataFrame(domain_analysis))
+                        
+                        # Run email finding only for valid domains
+                        if valid_domains and st.button("🚀 Find Emails from CSV (Valid Domains Only)", type="primary"):
+                            scout = create_scout(options)
+                            
+                            with st.spinner("Processing CSV data and finding emails..."):
+                                try:
+                                    # Prepare data for bulk processing (only valid domains)
+                                    bulk_data = [{"domain": item["domain"], "names": item["names"]} for item in valid_domains]
+                                    
+                                    # Show what we're processing
+                                    st.write("**Processing these valid domains and names:**")
+                                    for item in bulk_data[:5]:  # Show first 5
+                                        st.write(f"- {item['domain']}: {', '.join(item['names'])}")
+                                    if len(bulk_data) > 5:
+                                        st.write(f"... and {len(bulk_data) - 5} more")
+                                    
+                                    results = scout.find_valid_emails_bulk(bulk_data)
+                                    
+                                    # Create results dataframe
+                                    results_data = []
+                                    for result in results:
+                                        for email in result["valid_emails"]:
+                                            results_data.append({
+                                                "Domain": result["domain"],
+                                                "Names": " + ".join(result["names"]) if result["names"] else "N/A",
+                                                "Valid Email": email
+                                            })
+                                    
+                                    if results_data:
+                                        results_df = pd.DataFrame(results_data)
+                                        st.success(f"Found {len(results_data)} valid emails!")
+                                        st.dataframe(results_df)
+                                        
+                                        # Download button
+                                        csv = results_df.to_csv(index=False)
+                                        st.download_button(
+                                            label="📥 Download Results CSV",
+                                            data=csv,
+                                            file_name="mailscout_results.csv",
+                                            mime="text/csv"
+                                        )
+                                    else:
+                                        st.warning("No valid emails found. This could be because:")
+                                        st.info("- The domains are catch-all (accept any email)")
+                                        st.info("- SMTP port 25 is blocked on your network")
+                                        st.info("- The email addresses don't exist")
+                                        
+                                except Exception as exc:
+                                    st.error(f"Error processing CSV: {exc}")
+                                    st.exception(exc)
+                        elif not valid_domains:
+                            st.info("💡 **Alternative: Generate Email Candidates**")
+                            st.write("Even without valid domains, you can generate email candidates for manual verification:")
+                            
+                            if st.button("📧 Generate Email Candidates", type="secondary"):
+                                all_candidates = []
+                                for item in email_data:
+                                    domain = item["domain"]
+                                    names = item["names"]
+                                    if names and domain:
+                                        # Generate email variants
+                                        scout = create_scout(options)
+                                        try:
+                                            candidates = scout.generate_email_variants(names, domain, normalize=options["normalize"])
+                                            for email in candidates:
+                                                all_candidates.append({
+                                                    "Domain": domain,
+                                                    "Names": " + ".join(names),
+                                                    "Generated Email": email,
+                                                    "Status": "Generated (Not Validated)"
+                                                })
+                                        except Exception:
+                                            # Fallback to simple generation
+                                            for name in names:
+                                                all_candidates.append({
+                                                    "Domain": domain,
+                                                    "Names": name,
+                                                    "Generated Email": f"{name.lower()}@{domain}",
+                                                    "Status": "Generated (Not Validated)"
+                                                })
+                                
+                                if all_candidates:
+                                    candidates_df = pd.DataFrame(all_candidates)
+                                    st.success(f"Generated {len(all_candidates)} email candidates!")
+                                    st.dataframe(candidates_df)
+                                    
+                                    # Download candidates
+                                    csv = candidates_df.to_csv(index=False)
+                                    st.download_button(
+                                        label="📥 Download Email Candidates CSV",
+                                        data=csv,
+                                        file_name="email_candidates.csv",
+                                        mime="text/csv"
+                                    )
+                                else:
+                                    st.warning("Could not generate email candidates.")
+                    else:
+                        st.warning("No valid data found. Check your column selection and data format.")
+                        st.info("Debug info:")
+                        st.write(f"Selected name columns: {name_columns}")
+                        st.write(f"Selected company column: {company_url_column}")
+                        st.write(f"Sample company values:")
+                        sample_values = df[company_url_column].dropna().head(5).tolist()
+                        for val in sample_values:
+                            st.write(f"- '{val}' -> Domain: '{extract_domain_from_url(str(val))}'")
+                        
+            except Exception as e:
+                st.error(f"Error reading CSV file: {e}")
 
     with tab_utils:
         st.subheader("Utilities")
