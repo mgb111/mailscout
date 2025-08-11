@@ -284,7 +284,7 @@ def main() -> None:
 
     options = render_sidebar()
 
-    tab_find, tab_bulk, tab_csv, tab_utils = st.tabs(["Find emails", "Bulk", "CSV Upload", "Utilities"])
+    tab_find, tab_bulk, tab_csv, tab_dns, tab_utils = st.tabs(["Find emails", "Bulk", "CSV Upload", "DNS Only", "Utilities"])
 
     with tab_find:
         st.subheader("Find Emails for a Domain")
@@ -486,53 +486,62 @@ def main() -> None:
                         
                         # Run email finding only for valid domains
                         if valid_domains and st.button("🚀 Find Emails from CSV (Valid Domains Only)", type="primary"):
-                            scout = create_scout(options)
+                            st.info("🔍 **DNS-Only Mode: Generating Email Candidates**")
+                            st.write("Since SMTP validation is blocked, we'll generate email candidates for valid domains.")
                             
-                            with st.spinner("Processing CSV data and finding emails..."):
+                            with st.spinner("Generating email candidates for valid domains..."):
                                 try:
-                                    # Prepare data for bulk processing (only valid domains)
-                                    bulk_data = [{"domain": item["domain"], "names": item["names"]} for item in valid_domains]
+                                    all_candidates = []
+                                    for item in valid_domains:
+                                        domain = item["domain"]
+                                        names = item["names"]
+                                        if names and domain:
+                                            # Generate email variants without SMTP validation
+                                            scout = create_scout(options)
+                                            try:
+                                                candidates = scout.generate_email_variants(names, domain, normalize=options["normalize"])
+                                                for email in candidates:
+                                                    all_candidates.append({
+                                                        "Domain": domain,
+                                                        "Names": " + ".join(names),
+                                                        "Generated Email": email,
+                                                        "Status": "✅ Valid Domain + Generated",
+                                                        "Validation": "DNS Only (SMTP Blocked)"
+                                                    })
+                                            except Exception:
+                                                # Fallback to simple generation
+                                                for name in names:
+                                                    all_candidates.append({
+                                                        "Domain": domain,
+                                                        "Names": name,
+                                                        "Generated Email": f"{name.lower()}@{domain}",
+                                                        "Status": "✅ Valid Domain + Generated",
+                                                        "Validation": "DNS Only (SMTP Blocked)"
+                                                    })
                                     
-                                    # Show what we're processing
-                                    st.write("**Processing these valid domains and names:**")
-                                    for item in bulk_data[:5]:  # Show first 5
-                                        st.write(f"- {item['domain']}: {', '.join(item['names'])}")
-                                    if len(bulk_data) > 5:
-                                        st.write(f"... and {len(bulk_data) - 5} more")
-                                    
-                                    results = scout.find_valid_emails_bulk(bulk_data)
-                                    
-                                    # Create results dataframe
-                                    results_data = []
-                                    for result in results:
-                                        for email in result["valid_emails"]:
-                                            results_data.append({
-                                                "Domain": result["domain"],
-                                                "Names": " + ".join(result["names"]) if result["names"] else "N/A",
-                                                "Valid Email": email
-                                            })
-                                    
-                                    if results_data:
-                                        results_df = pd.DataFrame(results_data)
-                                        st.success(f"Found {len(results_data)} valid emails!")
+                                    if all_candidates:
+                                        results_df = pd.DataFrame(all_candidates)
+                                        st.success(f"✅ Generated {len(all_candidates)} email candidates for valid domains!")
                                         st.dataframe(results_df)
                                         
                                         # Download button
                                         csv = results_df.to_csv(index=False)
                                         st.download_button(
-                                            label="📥 Download Results CSV",
+                                            label="📥 Download Valid Domain Results CSV",
                                             data=csv,
-                                            file_name="mailscout_results.csv",
+                                            file_name="valid_domain_emails.csv",
                                             mime="text/csv"
                                         )
+                                        
+                                        st.info("💡 **Next Steps:**")
+                                        st.info("- These emails are generated from valid domains")
+                                        st.info("- Use a separate email validation service to verify them")
+                                        st.info("- Or try sending test emails to see which ones work")
                                     else:
-                                        st.warning("No valid emails found. This could be because:")
-                                        st.info("- The domains are catch-all (accept any email)")
-                                        st.info("- SMTP port 25 is blocked on your network")
-                                        st.info("- The email addresses don't exist")
+                                        st.warning("Could not generate email candidates for valid domains.")
                                         
                                 except Exception as exc:
-                                    st.error(f"Error processing CSV: {exc}")
+                                    st.error(f"Error generating email candidates: {exc}")
                                     st.exception(exc)
                         elif not valid_domains:
                             st.info("💡 **Alternative: Generate Email Candidates**")
@@ -553,7 +562,8 @@ def main() -> None:
                                                     "Domain": domain,
                                                     "Names": " + ".join(names),
                                                     "Generated Email": email,
-                                                    "Status": "Generated (Not Validated)"
+                                                    "Status": "Generated (Not Validated)",
+                                                    "Domain Status": "❌ Invalid Domain"
                                                 })
                                         except Exception:
                                             # Fallback to simple generation
@@ -562,7 +572,8 @@ def main() -> None:
                                                     "Domain": domain,
                                                     "Names": name,
                                                     "Generated Email": f"{name.lower()}@{domain}",
-                                                    "Status": "Generated (Not Validated)"
+                                                    "Status": "Generated (Not Validated)",
+                                                    "Domain Status": "❌ Invalid Domain"
                                                 })
                                 
                                 if all_candidates:
@@ -592,6 +603,104 @@ def main() -> None:
                         
             except Exception as e:
                 st.error(f"Error reading CSV file: {e}")
+
+    with tab_dns:
+        st.subheader("🔍 DNS-Only Email Generation")
+        st.caption("Generate email candidates without SMTP validation. Perfect when port 25 is blocked.")
+        
+        domain_dns = st.text_input("Domain", placeholder="example.com", key="dns_domain")
+        names_dns = st.text_area("Names (optional)", height=120, help="Enter names separated by commas or new lines", key="dns_names")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            check_domain = st.button("🔍 Check Domain", type="secondary")
+        with col2:
+            generate_emails = st.button("📧 Generate Emails", type="primary")
+        
+        parsed_names_dns = parse_names_input(names_dns) if names_dns else None
+        
+        if check_domain and domain_dns:
+            with st.spinner("Checking domain validity..."):
+                validation = validate_domain_before_processing(domain_dns)
+                
+                st.write("**Domain Validation Results:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Domain Exists", "✅ Yes" if validation["domain_exists"] else "❌ No")
+                with col2:
+                    st.metric("Has Mail Servers", "✅ Yes" if validation["has_mx_records"] else "❌ No")
+                with col3:
+                    st.metric("Valid for Email", "✅ Yes" if validation["is_valid"] else "❌ No")
+                
+                if validation["is_valid"]:
+                    st.success(f"✅ {domain_dns} is a valid domain with mail servers!")
+                elif validation["domain_exists"]:
+                    st.warning(f"⚠️ {domain_dns} exists but has no mail servers.")
+                else:
+                    st.error(f"❌ {domain_dns} does not exist.")
+        
+        if generate_emails and domain_dns:
+            with st.spinner("Generating email candidates..."):
+                try:
+                    scout = create_scout(options)
+                    all_candidates = []
+                    
+                    if parsed_names_dns:
+                        # Generate emails for specific names
+                        if isinstance(parsed_names_dns[0], list):
+                            for person in parsed_names_dns:
+                                candidates = scout.generate_email_variants(person, domain_dns, normalize=options["normalize"])
+                                for email in candidates:
+                                    all_candidates.append({
+                                        "Domain": domain_dns,
+                                        "Names": " + ".join(person),
+                                        "Generated Email": email,
+                                        "Type": "Name-based"
+                                    })
+                        else:
+                            candidates = scout.generate_email_variants(parsed_names_dns, domain_dns, normalize=options["normalize"])
+                            for email in candidates:
+                                all_candidates.append({
+                                    "Domain": domain_dns,
+                                    "Names": " + ".join(parsed_names_dns),
+                                    "Generated Email": email,
+                                    "Type": "Name-based"
+                                })
+                    else:
+                        # Generate common prefixes
+                        candidates = scout.generate_prefixes(domain_dns)
+                        for email in candidates:
+                            all_candidates.append({
+                                "Domain": domain_dns,
+                                "Names": "N/A",
+                                "Generated Email": email,
+                                "Type": "Common Prefix"
+                            })
+                    
+                    if all_candidates:
+                        results_df = pd.DataFrame(all_candidates)
+                        st.success(f"✅ Generated {len(all_candidates)} email candidates!")
+                        st.dataframe(results_df)
+                        
+                        # Download button
+                        csv = results_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Email Candidates CSV",
+                            data=csv,
+                            file_name=f"dns_emails_{domain_dns}.csv",
+                            mime="text/csv"
+                        )
+                        
+                        st.info("💡 **Next Steps:**")
+                        st.info("- These are generated email candidates")
+                        st.info("- Use an email validation service to verify them")
+                        st.info("- Or try sending test emails to see which ones work")
+                    else:
+                        st.warning("Could not generate email candidates.")
+                        
+                except Exception as exc:
+                    st.error(f"Error generating emails: {exc}")
+                    st.exception(exc)
 
     with tab_utils:
         st.subheader("Utilities")
